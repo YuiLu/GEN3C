@@ -774,7 +774,7 @@ class Gen3cClient():
 		data = pickle.dumps(req)
 		try:
 			progress_direction = "both" if depth_was_missing else "auto"
-			return httpx_request("post", url, data=data, timeout=self.req_timeout_s,
+			return httpx_request("post", url, content=data, timeout=self.req_timeout_s,
 								 progress=True, progress_direction=progress_direction,
 								 desc="Seeding",
 								 async_client=(None if sync else self.client),

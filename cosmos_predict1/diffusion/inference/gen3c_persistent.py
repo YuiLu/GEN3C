@@ -1,5 +1,6 @@
 import argparse
 import os
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 import time
 
 from moge.model.v1 import MoGeModel
@@ -115,14 +116,15 @@ class Gen3cPersistentModel():
             num_video_frames=self.frames_per_batch,
             seed=args.seed,
         )
-        if args.num_gpus > 1:
-            pipeline.model.net.enable_context_parallel(process_group)
+        #if args.num_gpus > 1:
+            #pipeline.model.net.enable_context_parallel(process_group)
 
         self.args = args
         self.frame_buffer_max = pipeline.model.frame_buffer_max
         self.generator = torch.Generator(device=device).manual_seed(args.seed)
         self.sample_n_frames = pipeline.model.chunk_size
-        self.moge_model = MoGeModel.from_pretrained("Ruicheng/moge-vitl").to(device)
+        model_path = "/root/.cache/huggingface/hub/models--Ruicheng--moge-vitl/snapshots/979e84da9415762c30e6c0cf8dc0962896c793df/model.pt"
+        self.moge_model = MoGeModel.from_pretrained(model_path).to(device)
         self.pipeline = pipeline
         self.device = device
         self.device_with_rank = device_with_rank(self.device)

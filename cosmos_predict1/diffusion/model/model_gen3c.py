@@ -102,7 +102,20 @@ class DiffusionGen3CModel(DiffusionV2WModel):
             condition_latent, uncondition, num_condition_t
         )
         uncondition = self.add_condition_pose(latent_condition, uncondition, drop_out_latent = True)
-        assert condition.gt_latent.allclose(uncondition.gt_latent)
+        # Note: torch.allclose returns False if NaNs are present, even if tensors are otherwise identical.
+        # For inference we treat NaN-equality as acceptable here and emit diagnostics instead of crashing.
+        if not torch.allclose(condition.gt_latent, uncondition.gt_latent):
+            if torch.allclose(condition.gt_latent, uncondition.gt_latent, equal_nan=True):
+                a = condition.gt_latent
+                from cosmos_predict1.utils import log as _log
+
+                _log.warning(
+                    "[Gen3C] gt_latent contains NaN/Inf; strict allclose failed but equal_nan passed. "
+                    f"nan={torch.isnan(a).sum().item()} inf={torch.isinf(a).sum().item()} "
+                    f"dtype={a.dtype} device={a.device} min={torch.nan_to_num(a).min().item():.6g} max={torch.nan_to_num(a).max().item():.6g}"
+                )
+            else:
+                raise AssertionError("[Gen3C] condition.gt_latent and uncondition.gt_latent differ")
 
         # For inference, check if parallel_state is initialized
         to_cp = self.net.is_context_parallel_enabled

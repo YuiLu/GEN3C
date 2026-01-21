@@ -1,0 +1,21 @@
+CUDA_HOME=$CONDA_PREFIX PYTHONPATH=$(pwd) python cosmos_predict1/diffusion/inference/gen3c_batch_infer.py \
+    --checkpoint_dir checkpoints \
+    --num_gpus 1 \
+    --guidance 1 \
+    --offload_tokenizer \
+    --offload_text_encoder_model \
+    --offload_prompt_upsampler \
+    --offload_guardrail_models \
+    --disable_guardrail \
+    --disable_prompt_encoder \
+    --foreground_masking \
+    --camera_txt_extrinsics_type c2w \
+    --save_buffer \
+    --output_mode 3 \
+    --trajectories_dir /data/Data/vbench_traj/vbench_traj/CCD \
+    --images_dir assets/diffusion \
+    --pairing_mode random_n \
+    --random_n 2 \
+    --random_seed 42 \
+    --devices 0,1 \
+    --video_save_folder outputs/CCD

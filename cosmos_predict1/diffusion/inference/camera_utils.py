@@ -15,6 +15,7 @@
 
 import torch
 import math
+from pathlib import Path
 import torch.nn.functional as F
 from .forward_warp_utils_pytorch import unproject_points
 
@@ -220,6 +221,280 @@ def generate_camera_trajectory(
         generated_intrinsics = initial_intrinsics.unsqueeze(0)
 
     return generated_w2cs, generated_intrinsics
+
+
+def _invert_extrinsics(rotation: torch.Tensor, translation: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert camera-to-world extrinsics to world-to-camera."""
+    rot_inv = rotation.transpose(0, 1)
+    trans_inv = -rot_inv @ translation
+    return rot_inv, trans_inv
+
+
+def load_camera_trajectory_from_txt(
+    file_path: str,
+    expected_frames: int | None = None,
+    device: torch.device | str = "cuda",
+    extrinsics_type: str = "w2c",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Load per-frame camera extrinsics and intrinsics from a whitespace separated txt file.
+
+    Each non-comment line should contain at least 19 values in the following order:
+        timestamp fx fy cx cy extra1 extra2
+        R11 R12 R13 tx
+        R21 R22 R23 ty
+        R31 R32 R33 tz
+
+    Additional trailing values are ignored. Lines starting with ``#`` or ``//`` are skipped.
+
+    Args:
+        file_path: Path to the txt file containing the trajectory.
+    expected_frames: Optional number of frames to match by interpolation or sampling.
+    device: Target device for the returned tensors.
+    extrinsics_type: Interpret the rotation/translation as ``w2c`` (default) or ``c2w``.
+
+    Notes:
+        GEN3C's forward-warp / unprojection utilities assume an OpenCV-like camera convention
+        (image x right, y down, camera z forward). Many Unity exports are authored in a Y-up
+        camera convention. This loader therefore converts incoming extrinsics to the convention
+        expected by the inference pipeline.
+
+    Returns:
+        Tuple of tensors ``(w2c, intrinsics)`` with shapes ``[1, T, 4, 4]`` and ``[1, T, 3, 3]`` respectively.
+    """
+
+    device = torch.device(device)
+    path = Path(file_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Camera trajectory file not found: {path}")
+
+    w2c_mats: list[torch.Tensor] = []
+    intrinsic_mats: list[torch.Tensor] = []
+    with path.open("r", encoding="utf-8") as f:
+        for line_idx, raw_line in enumerate(f):
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith("#") or line.startswith("//"):
+                continue
+
+            # Remove trailing comments inline
+            for comment_token in ("#", "//"):
+                if comment_token in line:
+                    line = line.split(comment_token, 1)[0].strip()
+            if not line:
+                continue
+
+            tokens = line.replace(",", " ").split()
+            if len(tokens) < 19:
+                # Skip headers or malformed lines silently so long as no cameras were parsed yet.
+                if w2c_mats:
+                    raise ValueError(
+                        f"Line {line_idx + 1} in {path} has {len(tokens)} values; 19 required."
+                    )
+                else:
+                    continue
+
+            try:
+                values = [float(tok) for tok in tokens[:19]]
+            except ValueError as exc:
+                if w2c_mats:
+                    raise ValueError(
+                        f"Failed to parse numeric values on line {line_idx + 1} of {path}: {exc}"
+                    ) from exc
+                continue
+
+            # Unpack values
+            _, fx, fy, cx, cy, *_unused = values[:7]
+            r11, r12, r13, tx = values[7:11]
+            r21, r22, r23, ty = values[11:15]
+            r31, r32, r33, tz = values[15:19]
+
+            rotation = torch.tensor(
+                [[r11, r12, r13], [r21, r22, r23], [r31, r32, r33]],
+                dtype=torch.float32,
+                device=device,
+            )
+            translation = torch.tensor([tx, ty, tz], dtype=torch.float32, device=device)
+
+            if extrinsics_type not in {"w2c", "c2w"}:
+                raise ValueError("extrinsics_type must be either 'w2c' or 'c2w'")
+
+            # Convert to world-to-camera first.
+            if extrinsics_type == "c2w":
+                rotation, translation = _invert_extrinsics(rotation, translation)
+
+            # Coordinate conversion (Unity-style camera Y-up -> OpenCV/GEN3C camera Y-down).
+            #
+            # IMPORTANT:
+            # A plain left-multiply R' = S R with S=diag(1,-1,1) makes det(R') negative
+            # (an improper rotation / reflection), which breaks quaternion-based interpolation
+            # in _resample_camera_sequence() and can lead to black renders.
+            #
+            # Use a similarity transform in camera coordinates instead:
+            #   R' = S R S,  t' = S t
+            # This keeps det(R')=+1 for proper rotations.
+            cam_basis = torch.tensor(
+                [[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0]],
+                dtype=torch.float32,
+                device=device,
+            )
+            rotation = cam_basis @ rotation @ cam_basis
+            translation = cam_basis @ translation
+
+            w2c = torch.eye(4, dtype=torch.float32, device=device)
+            w2c[:3, :3] = rotation
+            w2c[:3, 3] = translation
+
+            intrinsics = torch.tensor(
+                [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]],
+                dtype=torch.float32,
+                device=device,
+            )
+
+            w2c_mats.append(w2c)
+            intrinsic_mats.append(intrinsics)
+
+    if not w2c_mats:
+        raise ValueError(f"No camera entries parsed from {path}")
+
+    w2c_tensor = torch.stack(w2c_mats, dim=0)
+    intrinsics_tensor = torch.stack(intrinsic_mats, dim=0)
+
+    if expected_frames is not None and expected_frames > 0:
+        w2c_tensor, intrinsics_tensor = _resample_camera_sequence(
+            w2c_tensor, intrinsics_tensor, expected_frames
+        )
+
+    return w2c_tensor.unsqueeze(0), intrinsics_tensor.unsqueeze(0)
+
+
+def _matrix_to_quaternion(rotation: torch.Tensor) -> torch.Tensor:
+    """Convert a 3x3 rotation matrix to a (w, x, y, z) quaternion."""
+    m00, m01, m02 = rotation[0]
+    m10, m11, m12 = rotation[1]
+    m20, m21, m22 = rotation[2]
+
+    trace = m00 + m11 + m22
+    if trace > 0.0:
+        s = torch.sqrt(trace + 1.0) * 2.0
+        w = 0.25 * s
+        x = (m21 - m12) / s
+        y = (m02 - m20) / s
+        z = (m10 - m01) / s
+    elif m00 > m11 and m00 > m22:
+        s = torch.sqrt(1.0 + m00 - m11 - m22) * 2.0
+        w = (m21 - m12) / s
+        x = 0.25 * s
+        y = (m01 + m10) / s
+        z = (m02 + m20) / s
+    elif m11 > m22:
+        s = torch.sqrt(1.0 + m11 - m00 - m22) * 2.0
+        w = (m02 - m20) / s
+        x = (m01 + m10) / s
+        y = 0.25 * s
+        z = (m12 + m21) / s
+    else:
+        s = torch.sqrt(1.0 + m22 - m00 - m11) * 2.0
+        w = (m10 - m01) / s
+        x = (m02 + m20) / s
+        y = (m12 + m21) / s
+        z = 0.25 * s
+
+    quat = torch.tensor([w, x, y, z], dtype=rotation.dtype, device=rotation.device)
+    quat = quat / torch.linalg.norm(quat)
+    return quat
+
+
+def _quaternion_to_matrix(quaternion: torch.Tensor) -> torch.Tensor:
+    """Convert a (w, x, y, z) quaternion to a 3x3 rotation matrix."""
+    q = quaternion / torch.linalg.norm(quaternion)
+    w, x, y, z = q
+    xx, yy, zz = x * x, y * y, z * z
+    xy, xz, yz = x * y, x * z, y * z
+    wx, wy, wz = w * x, w * y, w * z
+
+    return torch.tensor(
+        [
+            [1 - 2 * (yy + zz), 2 * (xy - wz), 2 * (xz + wy)],
+            [2 * (xy + wz), 1 - 2 * (xx + zz), 2 * (yz - wx)],
+            [2 * (xz - wy), 2 * (yz + wx), 1 - 2 * (xx + yy)],
+        ],
+        dtype=quaternion.dtype,
+        device=quaternion.device,
+    )
+
+
+def _slerp(q0: torch.Tensor, q1: torch.Tensor, t: float) -> torch.Tensor:
+    q0 = q0 / torch.linalg.norm(q0)
+    q1 = q1 / torch.linalg.norm(q1)
+    dot = torch.dot(q0, q1)
+    if dot < 0.0:
+        q1 = -q1
+        dot = -dot
+
+    if dot > 0.9995:
+        result = q0 + t * (q1 - q0)
+        return result / torch.linalg.norm(result)
+
+    theta_0 = torch.acos(torch.clamp(dot, -1.0, 1.0))
+    theta = theta_0 * t
+    q2 = q1 - q0 * dot
+    q2 = q2 / torch.linalg.norm(q2)
+    return q0 * torch.cos(theta) + q2 * torch.sin(theta)
+
+
+def _resample_camera_sequence(
+    w2c_tensor: torch.Tensor, intrinsics_tensor: torch.Tensor, target_frames: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    original_frames = w2c_tensor.shape[0]
+    if original_frames == target_frames:
+        return w2c_tensor, intrinsics_tensor
+
+    if original_frames == 1:
+        w2c_resampled = w2c_tensor.repeat(target_frames, 1, 1)
+        intrinsics_resampled = intrinsics_tensor.repeat(target_frames, 1, 1)
+        return w2c_resampled, intrinsics_resampled
+
+    device = w2c_tensor.device
+    rotations = w2c_tensor[:, :3, :3]
+    translations = w2c_tensor[:, :3, 3]
+    intrinsics = intrinsics_tensor
+
+    indices = torch.linspace(0, original_frames - 1, target_frames, device=device)
+    idx0 = torch.floor(indices).long()
+    idx1 = torch.clamp(idx0 + 1, max=original_frames - 1)
+    alphas = indices - idx0.float()
+
+    resampled_rot = []
+    resampled_trans = []
+    resampled_intrinsics = []
+
+    for frame_idx in range(target_frames):
+        lo = idx0[frame_idx].item()
+        hi = idx1[frame_idx].item()
+        alpha_t = float(alphas[frame_idx].item())
+        if lo == hi or alpha_t == 0.0:
+            resampled_rot.append(rotations[lo].clone())
+            resampled_trans.append(translations[lo].clone())
+            resampled_intrinsics.append(intrinsics[lo].clone())
+            continue
+
+        q0 = _matrix_to_quaternion(rotations[lo])
+        q1 = _matrix_to_quaternion(rotations[hi])
+        q_interp = _slerp(q0, q1, alpha_t)
+        resampled_rot.append(_quaternion_to_matrix(q_interp))
+
+        resampled_trans.append(((1 - alpha_t) * translations[lo] + alpha_t * translations[hi]).clone())
+        resampled_intrinsics.append(((1 - alpha_t) * intrinsics[lo] + alpha_t * intrinsics[hi]).clone())
+
+    w2c_final = torch.zeros((target_frames, 4, 4), dtype=w2c_tensor.dtype, device=device)
+    w2c_final[:, :3, :3] = torch.stack(resampled_rot)
+    w2c_final[:, :3, 3] = torch.stack(resampled_trans)
+    w2c_final[:, 3, 3] = 1.0
+
+    intrinsics_final = torch.stack(resampled_intrinsics)
+
+    return w2c_final, intrinsics_final
 
 
 def _align_inv_depth_to_depth(

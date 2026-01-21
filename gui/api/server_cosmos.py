@@ -79,13 +79,18 @@ class CosmosModel(CosmosBaseModel):
 			"--trajectory", "none",
 			"--prompt=", # Empty string
 			"--negative_prompt=", # Empty string
-			"--offload_prompt_upsampler",
-			"--disable_prompt_upsampler",
-			"--disable_guardrail",
-			"--num_gpus", str(gpu_count),
-			"--guidance", "1.0",
-			"--num_video_frames", "121",
-			"--foreground_masking",
+		# 添加所有的 offload 参数
+        "--offload_diffusion_transformer",
+        "--offload_tokenizer", 
+        "--offload_text_encoder_model",
+        "--offload_prompt_upsampler",
+        "--offload_guardrail_models",
+        "--disable_guardrail",
+        "--disable_prompt_encoder",
+        "--num_gpus", str(gpu_count),
+        "--guidance", "1.0",
+        "--num_video_frames", "121",
+        "--foreground_masking",
 		]
 		args = parser.parse_args(common_args)
 

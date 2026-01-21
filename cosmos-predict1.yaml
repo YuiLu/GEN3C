@@ -14,7 +14,7 @@
 # limitations under the License.
 
 # conda env create --file cosmos-predict1.yaml
-name: cosmos-predict1
+name: gen3c
 channels:
   - conda-forge
 dependencies:
